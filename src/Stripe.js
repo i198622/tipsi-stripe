@@ -1,13 +1,30 @@
-import { NativeModules, Platform } from 'react-native'
+import { NativeEventEmitter, NativeModules, Platform } from 'react-native'
 import processTheme from './utils/processTheme'
 import checkArgs from './utils/checkArgs'
 import checkInit from './utils/checkInit'
 import * as types from './utils/types'
 import errorCodes from './errorCodes'
+import EventEmitter from 'react-native/Libraries/vendor/emitter/EventEmitter'
 
 const { StripeModule } = NativeModules
+const stripeEventEmitter = new NativeEventEmitter(TPSStripeManager);
 
-class Stripe {
+class Stripe extends EventEmitter {
+  constructor() {
+    super();
+
+    let eventEmitter = this;
+    this.clearEventListeners();
+
+    this.onShippingMethodChanged = stripeEventEmitter.addListener(
+      'onShippingMethodChanged',
+      (method) => { eventEmitter.emit('onShippingMethodChanged', method) }
+    )
+    this.onShippingContactChanged = stripeEventEmitter.addListener(
+      'onShippingContactChanged',
+      (contact) => { eventEmitter.emit('onShippingContactChanged', contact) }
+    )
+  }
   stripeInitialized = false
 
   setOptions = (options = {}) => {
@@ -93,7 +110,8 @@ class Stripe {
 
   // @deprecated use completeNativePayRequest
   completeApplePayRequest = () => {
-    checkInit(this)
+    checkInit(this);
+    this.clearEventListeners();
     return StripeModule.completeApplePayRequest()
   }
 
@@ -108,6 +126,7 @@ class Stripe {
   // @deprecated use cancelNativePayRequest
   cancelApplePayRequest = () => {
     checkInit(this)
+    this.clearEventListeners();
     return StripeModule.cancelApplePayRequest()
   }
 
@@ -169,6 +188,30 @@ class Stripe {
       params, 'params', 'Stripe.createSourceWithParams'
     )
     return StripeModule.createSourceWithParams(params)
+  }
+
+  updateSummaryItemsAndShippingMethods = ( items = [], methods = [], errors = [], callback = () => {}) => {
+    checkInit(this)
+    checkArgs(
+      types.updateSummaryItemsPropTypes,
+      items, 'items', 'Stripe.updateSummaryItemsAndShippingMethods'
+    )
+    checkArgs(
+      types.updateShippingMethodsPropTypes,
+      methods, 'methods', 'Stripe.updateSummaryItemsAndShippingMethods'
+    )
+    return TPSStripeManager.updateSummaryItems(items, methods, errors, callback)
+  }
+
+  clearEventListeners = () => {
+    if (this.onShippingContactChanged) {
+      this.onShippingContactChanged.remove();
+      this.onShippingContactChanged = null;
+    }
+    if (this.onShippingMethodChanged) {
+      this.onShippingMethodChanged.remove();
+      this.onShippingMethodChanged = null;
+    }
   }
 }
 

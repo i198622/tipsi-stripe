@@ -102,12 +102,15 @@ NSString * const TPSPaymentNetworkVisa = @"visa";
 {
     NSString *publishableKey;
     NSString *merchantId;
+    NSArray *shippingMethods;
+    NSArray *summaryItems;
     NSDictionary *errorCodes;
 
     RCTPromiseResolveBlock promiseResolver;
     RCTPromiseRejectBlock promiseRejector;
 
     BOOL requestIsCompleted;
+    BOOL hasListeners;
 
     void (^applePayCompletion)(PKPaymentAuthorizationStatus);
     NSError *applePayStripeError;
@@ -385,6 +388,122 @@ RCT_EXPORT_METHOD(paymentRequestWithCardForm:(NSDictionary *)options
     });
 }
 
+- (void)startObserving {
+    hasListeners = YES;
+}
+
+- (void)stopObserving {
+    hasListeners = NO;
+}
+
+- (NSArray<NSString *> *)supportedEvents {
+    return @[@"onShippingMethodChanged",@"onShippingContactChanged"];
+}
+
+- (void)paymentAuthorizationViewController:(PKPaymentAuthorizationViewController *)controller didSelectShippingMethod:(PKShippingMethod *)shippingMethod handler:(void (^)(PKPaymentRequestShippingMethodUpdate * _Nonnull))completion  API_AVAILABLE(ios(11.0)){
+    if (hasListeners) {
+        self.shippingMethodCompletion = completion;
+        [self sendEventWithName: @"onShippingMethodChanged" body:@{@"selectedShippingMethodId": shippingMethod.identifier} ];
+    } else {
+        completion([[PKPaymentRequestShippingMethodUpdate alloc] initWithPaymentSummaryItems:summaryItems]);
+    }
+}
+
+- (void)paymentAuthorizationViewController:(PKPaymentAuthorizationViewController *)controller didSelectShippingContact:(PKContact *)contact handler:(void (^)(PKPaymentRequestShippingContactUpdate * _Nonnull))completion  API_AVAILABLE(ios(11.0)){
+    if (hasListeners) {
+        self.shippingContactCompletion = completion;
+        [self sendEventWithName: @"onShippingContactChanged" body:@{
+                                                                  @"city": contact.postalAddress.city,
+                                                                  @"region": contact.postalAddress.state,
+                                                                  @"country": [contact.postalAddress.ISOCountryCode uppercaseString],
+                                                                  @"postalCode": contact.postalAddress.postalCode,
+                                                                  @"city": contact.postalAddress.city
+                                                                  } ];
+    } else {
+        completion([[PKPaymentRequestShippingContactUpdate alloc] initWithPaymentSummaryItems:summaryItems]);
+    }
+}
+
+- (NSMutableArray *)makePaymentErrors:(NSArray *)errors {
+    NSMutableArray *paymentErrors = [[NSMutableArray alloc] init];
+    for (NSDictionary *error in errors) {
+        NSError *paymentError;
+        if ([error[@"type"] isEqualToString: @"name"]) {
+            paymentError = [PKPaymentRequest paymentContactInvalidErrorWithContactField:error[@"field"] localizedDescription:error[@"description"]];
+        }
+        if ([error[@"type"] isEqualToString: @"shippingAddressUnserviceable"]) {
+            paymentError = [PKPaymentRequest paymentShippingAddressUnserviceableErrorWithLocalizedDescription: error[@"description"]];
+        }
+        if ([error[@"type"] isEqualToString: @"shippingAddressInvalid"]) {
+            paymentError = [PKPaymentRequest paymentShippingAddressInvalidErrorWithKey:error[@"field"] localizedDescription: error[@"description"]];
+        }
+        if ([error[@"type"] isEqualToString: @"billingAddressInvalid"]) {
+            paymentError = [PKPaymentRequest paymentBillingAddressInvalidErrorWithKey:error[@"field"] localizedDescription: error[@"description"]];
+        }
+
+        if (paymentError != nil) {
+            [paymentErrors addObject:paymentError];
+        }
+    }
+    return paymentErrors;
+}
+
+RCT_EXPORT_METHOD(updateSummaryItems: (NSArray *) items
+                  andShippingMethods: (NSArray *) methods
+                  withErrors: (NSArray *)errors
+                  callback: (RCTResponseSenderBlock) callback) {
+    if (!self.shippingContactCompletion && !self.shippingMethodCompletion) {
+        NSLog(@"Attempted to update payment summary items with no completion.");
+        return callback(@[@{@"error": @"Cannot update details"}]);
+    }
+
+    shippingMethods = [self shippingMethodsFromDetails: methods];
+    summaryItems = [self summaryItemsFromDetails: items];
+
+    if (self.shippingMethodCompletion) {
+        self.shippingMethodCompletion([[PKPaymentRequestShippingMethodUpdate alloc] initWithPaymentSummaryItems:summaryItems]);
+        self.shippingMethodCompletion = nil;
+    }
+
+    if (self.shippingContactCompletion) {
+        PKPaymentRequestShippingContactUpdate *update = [[PKPaymentRequestShippingContactUpdate alloc] initWithPaymentSummaryItems:summaryItems];
+        update.errors = [self makePaymentErrors:errors];
+        update.shippingMethods = shippingMethods;
+
+        self.shippingContactCompletion(update);
+        self.shippingContactCompletion = nil;
+    }
+    callback(nil);
+}
+
+- (NSArray*) shippingMethodsFromDetails: (NSArray *) details {
+    NSMutableArray *shippingMethods = [NSMutableArray array];
+
+    for (NSDictionary *item in details) {
+        PKShippingMethod *shippingItem = [[PKShippingMethod alloc] init];
+        shippingItem.label = item[@"label"];
+        shippingItem.detail = item[@"detail"];
+        shippingItem.amount = [NSDecimalNumber decimalNumberWithString:item[@"amount"]];
+        shippingItem.identifier = item[@"id"];
+        [shippingMethods addObject:shippingItem];
+    }
+
+    return shippingMethods;
+}
+
+- (NSArray*) summaryItemsFromDetails: (NSArray *)details {
+    NSMutableArray *summaryItems = [NSMutableArray array];
+
+    for (NSDictionary *item in details) {
+        PKPaymentSummaryItem *summaryItem = [[PKPaymentSummaryItem alloc] init];
+        summaryItem.label = item[@"label"];
+        summaryItem.amount = [NSDecimalNumber decimalNumberWithString:item[@"amount"]];
+        [summaryItems addObject:summaryItem];
+    }
+    return summaryItems;
+}
+
+
 RCT_EXPORT_METHOD(paymentRequestWithApplePay:(NSArray *)items
                                     withOptions:(NSDictionary *)options
                                     resolver:(RCTPromiseResolveBlock)resolve
@@ -406,6 +525,8 @@ RCT_EXPORT_METHOD(paymentRequestWithApplePay:(NSArray *)items
     NSMutableArray *shippingMethodsItems = options[@"shippingMethods"] ? options[@"shippingMethods"] : [NSMutableArray array];
     NSString* currencyCode = options[@"currencyCode"] ? options[@"currencyCode"] : @"USD";
     NSString* countryCode = options[@"countryCode"] ? options[@"countryCode"] : @"US";
+    shippingMethods = [self shippingMethodsFromDetails: shippingMethodsItems];
+    summaryItems = [self summaryItemsFromDetails: items];
 
     NSMutableArray *shippingMethods = [NSMutableArray array];
 
